@@ -2,6 +2,15 @@ import torch, torchvision, os, collections
 from netdissect import parallelfolder, zdataset, renormalize, segmenter
 from . import oldalexnet, oldvgg16, oldresnet152
 
+import lv.dissection.datasets
+from lv.ext.pretorched.gans import biggan
+from lv.ext.torchvision import models
+
+def load_biggan(domain):
+    if domain == 'places':
+        domain = 'places365'
+    return biggan.SeqBigGAN(pretrained=domain)
+
 def load_proggan(domain):
     # Automatically download and cache progressive GAN model
     # (From Karras, converted from Tensorflow to Pytorch.)
@@ -24,25 +33,42 @@ def load_proggan(domain):
     model = proggan.from_state_dict(sd)
     return model
 
-def load_classifier(architecture):
-    model_factory = dict(
-            alexnet=oldalexnet.AlexNet,
-            vgg16=oldvgg16.vgg16,
-            resnet152=oldresnet152.OldResNet152)[architecture]
-    weights_filename = dict(
-            alexnet='alexnet_places365-92864cf6.pth',
-            vgg16='vgg16_places365-0bafbc55.pth',
-            resnet152='resnet152_places365-f928166e5c.pth')[architecture]
-    model = model_factory(num_classes=365)
-    baseurl = 'https://dissect.csail.mit.edu/models/'
-    url = baseurl + weights_filename
-    try:
-        sd = torch.hub.load_state_dict_from_url(url) # pytorch 1.1
-    except:
-        sd = torch.hub.model_zoo.load_url(url) # pytorch 1.0
-    model.load_state_dict(sd)
+def load_classifier(architecture, domain='places'):
+    if domain == 'places':
+        model_factory = dict(
+                alexnet=oldalexnet.AlexNet,
+                vgg16=oldvgg16.vgg16,
+                resnet152=oldresnet152.OldResNet152)[architecture]
+        weights_filename = dict(
+                alexnet='alexnet_places365-92864cf6.pth',
+                vgg16='vgg16_places365-0bafbc55.pth',
+                resnet152='resnet152_places365-f928166e5c.pth')[architecture]
+        model = model_factory(num_classes=365)
+        baseurl = 'https://dissect.csail.mit.edu/models/'
+        url = baseurl + weights_filename
+        try:
+            sd = torch.hub.load_state_dict_from_url(url) # pytorch 1.1
+        except:
+            sd = torch.hub.model_zoo.load_url(url) # pytorch 1.0
+        model.load_state_dict(sd)
+    else:
+        assert domain == 'imagenet'
+        model_factory = dict(
+            alexnet=models.alexnet_seq,
+            vgg16=models.vgg16_seq,
+            resnet152=models.resnet152_seq,
+        )[architecture]
+        model = model_factory(pretrained=True)
     model.eval()
     return model
+
+
+def load_biggan_dataset(domain):
+    if domain == 'places':
+        domain = 'places365'
+    path = f'biggan-zs-{domain}.pth'
+    return lv.dissection.datasets.TensorDatasetOnDisk(path)
+    
 
 def load_dataset(domain, split=None, full=False, crop_size=None, download=True):
     if domain in ['places', 'imagenet']:

@@ -5,15 +5,22 @@ from netdissect import pbar, nethook, renormalize, pidfile, zdataset
 from netdissect import upsample, tally, imgviz, imgsave, bargraph
 from . import setting
 import netdissect
+
+# NOTE(evandez): Muck with path to add my other repo. 
+import sys
+from pathlib import Path
+sys.path.append(Path(__file__).parents[2] / "neuron-descriptions")
+from src.deps.ext.pretorched.gans import biggan
+
 torch.backends.cudnn.benchmark = True
 
 def parseargs():
     parser = argparse.ArgumentParser()
     def aa(*args, **kwargs):
         parser.add_argument(*args, **kwargs)
-    aa('--model', choices=['alexnet', 'vgg16', 'resnet152', 'progan'],
+    aa('--model', choices=['alexnet', 'vgg16', 'resnet152', 'progan', 'biggan'],
             default='alexnet')
-    aa('--dataset', choices=['places', 'church', 'kitchen', 'livingroom',
+    aa('--dataset', choices=['imagenet', 'places', 'church', 'kitchen', 'livingroom',
                              'bedroom'],
             default='places')
     aa('--seg', choices=['net', 'netp', 'netq', 'netpq', 'netpqc', 'netpqxc'],
@@ -38,11 +45,11 @@ def main():
 
     model = load_model(args)
     layername = instrumented_layername(args)
-    model.retain_layer(layername)
+    model.retain_layer(layername, detach=args.model != 'biggan')
     dataset = load_dataset(args, model=model.model)
     upfn = make_upfn(args, dataset, model, layername)
     sample_size = len(dataset)
-    is_generator = (args.model == 'progan')
+    is_generator = (args.model in ('biggan', 'progan'))
     percent_level = 1.0 - args.quantile
     iou_threshold = args.miniou
     image_row_width = 5
@@ -50,10 +57,12 @@ def main():
 
     # Tally rq.np (representation quantile, unconditional).
     pbar.descnext('rq')
-    def compute_samples(batch, *args):
-        data_batch = batch.cuda()
+    def compute_samples(*batch):
+        data_batch = prepare_batch(batch, args)
         _ = model(data_batch)
         acts = model.retained_layer(layername)
+        if args.model == 'biggan':
+            acts = acts.h.detach()
         hacts = upfn(acts)
         return hacts.permute(0, 2, 3, 1).contiguous().view(-1, acts.shape[1])
     rq = tally.tally_quantile(compute_samples, dataset,
@@ -65,10 +74,12 @@ def main():
 
     # Create visualizations - first we need to know the topk
     pbar.descnext('topk')
-    def compute_image_max(batch, *args):
-        data_batch = batch.cuda()
+    def compute_image_max(*batch):
+        data_batch = prepare_batch(batch, args)
         _ = model(data_batch)
         acts = model.retained_layer(layername)
+        if args.model == 'biggan':
+            acts = acts.h.detach()
         acts = acts.view(acts.shape[0], acts.shape[1], -1)
         acts = acts.max(2)[0]
         return acts
@@ -80,7 +91,10 @@ def main():
     pbar.descnext('unit_images')
     image_size, image_source = None, None
     if is_generator:
-        image_size = model(dataset[0][0].cuda()[None,...]).shape[2:]
+        if args.model == 'biggan':
+            image_size = 256
+        else:
+            image_size = model(dataset[0][0].cuda()[None,...]).shape[2:]
     else:
         image_source = dataset
     iv = imgviz.ImageVisualizer((args.thumbsize, args.thumbsize),
@@ -88,10 +102,12 @@ def main():
         source=dataset,
         quantiles=rq,
         level=rq.quantiles(percent_level))
-    def compute_acts(data_batch, *ignored_class):
-        data_batch = data_batch.cuda()
+    def compute_acts(*batch):
+        data_batch = prepare_batch(batch, args)
         out_batch = model(data_batch)
         acts_batch = model.retained_layer(layername)
+        if args.model == 'biggan':
+            acts_batch = acts_batch.h.detach()
         if is_generator:
             return (acts_batch, out_batch)
         else:
@@ -110,12 +126,14 @@ def main():
 
     segmodel, seglabels, segcatlabels = setting.load_segmenter(args.seg)
     renorm = renormalize.renormalizer(dataset, target='zc')
-    def compute_conditional_indicator(batch, *args):
-        data_batch = batch.cuda()
+    def compute_conditional_indicator(*batch):
+        data_batch = prepare_batch(batch, args)
         out_batch = model(data_batch)
         image_batch = out_batch if is_generator else renorm(data_batch)
         seg = segmodel.segment_batch(image_batch, downsample=4)
         acts = model.retained_layer(layername)
+        if args.model == 'biggan':
+            acts = acts.h.detach()
         hacts = upfn(acts)
         iacts = (hacts > level_at_99).float() # indicator
         return tally.conditional_samples(iacts, seg)
@@ -149,6 +167,17 @@ def main():
     copy_static_file('report.html', resfile('+report.html'))
     resfile.done();
 
+def prepare_batch(batch, args): 
+    batch = [
+        item.cuda() if isinstance(item, torch.Tensor) else item
+        for item in batch
+    ]
+    if args.model == 'biggan':
+        data_batch = biggan.GInputs(*batch)
+    else:
+        data_batch, *_ = batch
+    return data_batch
+
 def make_upfn(args, dataset, model, layername):
     '''Creates an upsampling function.'''
     convs, data_shape = None, None
@@ -159,6 +188,16 @@ def make_upfn(args, dataset, model, layername):
         # Probe the data shape
         out = model(dataset[0][0][None,...].cuda())
         data_shape = model.retained_layer(layername).shape[2:]
+        upfn = upsample.upsampler(
+                (64, 64),
+                data_shape=data_shape,
+                image_size=out.shape[2:])
+        return upfn
+    elif args.model == 'biggan':
+        z, y = dataset[0]
+        inputs = biggan.GInputs(z[None].cuda(), y[None].cuda())
+        out = model(inputs)
+        data_shape = model.retained_layer(layername).h.shape[2:]
         upfn = upsample.upsampler(
                 (64, 64),
                 data_shape=data_shape,
@@ -195,9 +234,11 @@ def instrumented_layername(args):
 def load_model(args):
     '''Loads one of the benchmark classifiers or generators.'''
     if args.model in ['alexnet', 'vgg16', 'resnet152']:
-        model = setting.load_classifier(args.model)
+        model = setting.load_classifier(args.model, domain=args.dataset)
     elif args.model == 'progan':
         model = setting.load_proggan(args.dataset)
+    elif args.model == 'biggan':
+        model = setting.load_biggan(args.dataset)
     model = nethook.InstrumentedModel(model).cuda().eval()
     return model
 
@@ -207,7 +248,10 @@ def load_dataset(args, model=None):
     if args.model == 'progan':
         dataset = zdataset.z_dataset_for_model(model, size=10000, seed=1)
         return dataset
-    elif args.dataset in ['places']:
+    elif args.model == 'biggan':
+        dataset = setting.load_biggan_dataset(args.dataset) 
+        return dataset
+    elif args.dataset in ['imagenet', 'places']:
         crop_size = 227 if args.model == 'alexnet' else 224
         return setting.load_dataset(args.dataset, split='val', full=True,
                 crop_size=crop_size, download=True)
