@@ -1,0 +1,3 @@
+[submodule "neuron-descriptions"]
+	path = neuron-descriptions
+	url = https://github.com/evandez/neuron-descriptions
